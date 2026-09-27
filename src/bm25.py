@@ -1,21 +1,33 @@
 """
-A minimal, vectorized BM25 implementation on top of scipy sparse matrices.
+Минималистичная, векторизованная реализация BM25 поверх разреженных
+(sparse) матриц scipy.
 
-We don't use the `rank_bm25` PyPI package: it scores query-vs-corpus with a
-pure-Python loop over every document, which is far too slow for a corpus of
-~190k items x ~2.5k queries. Everything below is standard BM25 (Robertson &
-Sparck Jones), just expressed as sparse-matrix algebra so it runs in
-seconds via scipy/numpy instead of minutes/hours in pure Python.
+Мы намеренно не используем пакет `rank_bm25` с PyPI: он считает скор
+запрос-документ обычным Python-циклом по каждому документу корпуса, что
+слишком медленно для ~190 тыс. объявлений x ~2.5 тыс. запросов (реальный
+бенчмарк) и тем более для ~345 тыс. объявлений при офлайн-валидации на
+train.parquet. Всё, что ниже, -- это классический BM25 (формула
+Robertson & Sparck Jones), просто выраженный как матричная алгебра на
+разреженных матрицах, поэтому весь расчёт занимает секунды через
+scipy/numpy вместо минут/часов на чистом Python.
 
-Reference formula (Okapi BM25):
+Формула (Okapi BM25):
     score(q, d) = sum_{t in q} IDF(t) * f(t,d)*(k1+1) /
                   (f(t,d) + k1*(1 - b + b*|d|/avgdl))
 
     IDF(t) = log(1 + (N - n_t + 0.5) / (n_t + 0.5))
 
-where f(t,d) is the raw term count of t in document d, |d| is document
-length, avgdl the average document length, N the number of documents and
-n_t the number of documents containing t.
+где f(t,d) -- "сырая" частота термина t в документе d, |d| -- длина
+документа (число токенов), avgdl -- средняя длина документа по корпусу,
+N -- число документов, n_t -- число документов, содержащих термин t.
+
+k1 и b -- стандартные гиперпараметры BM25: k1 отвечает за насыщение
+(насколько быстро повторное вхождение термина перестаёт добавлять вес),
+b -- за силу нормировки по длине документа. Используются
+общепринятые в литературе значения по умолчанию (k1=1.5, b=0.75), без
+отдельного тюнинга под этот датасет -- в отличие от весов полей
+(ITEM_FIELD_WEIGHTS), которые заметно влияют на recall и поэтому
+подбирались отдельно (см. src/data_prep.py).
 """
 
 import numpy as np
@@ -27,74 +39,107 @@ class BM25Index:
     def __init__(self, k1: float = 1.5, b: float = 0.75, min_df: int = 2, max_df: float = 1.0):
         self.k1 = k1
         self.b = b
-        # max_df prunes very common tokens (e.g. domain-wide words like
-        # "услуга"/"работа") from the vocabulary entirely. This matters a
-        # lot more here than in typical TF-IDF use: without it, the
-        # query x item score matrix (query_terms @ item_terms.T) stops
-        # being meaningfully sparse -- almost every item shares at least
-        # one common word with almost every query, so the sparse dot
-        # product materializes a near-fully-dense result and blows up
-        # memory (observed >10GB RSS on the full item corpus). BM25's own
-        # IDF term would eventually down-weight these tokens too, but
-        # that only fixes the *score*, not the *memory blow-up*, since
-        # the matrix stays structurally dense either way.
+        # max_df полностью выбрасывает из словаря слишком частые токены
+        # (например, шаблонные слова-метки вида "услуга"/"работа").
+        # Это гораздо важнее здесь, чем в типичном использовании TF-IDF:
+        # без этой отсечки матрица скоров (запросы x объявления)
+        # перестаёт быть содержательно разреженной -- почти каждое
+        # объявление делит хотя бы одно общее слово почти с каждым
+        # запросом, из-за чего разреженное произведение матриц на деле
+        # получается почти полностью плотным и "взрывает" память
+        # (на полном корпусе объявлений это давало >10 ГБ RSS -- см.
+        # раздел "Найденные ошибки" в README.md). Собственный IDF внутри
+        # BM25 в итоге тоже занизил бы вес таких токенов, но это чинит
+        # только сам СКОР, а не проблему с памятью, потому что структура
+        # (список ненулевых позиций) матрицы всё равно останется плотной,
+        # пока термин не убран из словаря целиком.
         self.vectorizer = CountVectorizer(min_df=min_df, max_df=max_df, dtype=np.float32)
-        self.bm25_matrix = None   # (n_docs, n_terms), BM25 document weights
-        self.idf_ = None          # (n_terms,)
+        self.bm25_matrix = None   # (n_docs, n_terms) -- BM25-веса документов, разреженная матрица
+        self.idf_ = None          # (n_terms,) -- IDF каждого термина словаря
 
     def fit(self, doc_texts):
-        """Fit vocabulary + BM25 weights on the item corpus."""
+        """Обучить словарь и посчитать BM25-веса на корпусе объявлений.
+
+        doc_texts -- pd.Series/список строк, по одной bag-of-words
+        строке на объявление (результат build_item_corpus_text)."""
+        # Шаг 1: обычный подсчёт "сырых" частот термина в документе (TF)
+        # через CountVectorizer -- это даёт разреженную матрицу
+        # (n_docs x n_terms), где значение [d, t] -- сколько раз термин t
+        # встретился в документе d.
         tf = self.vectorizer.fit_transform(doc_texts).tocsr()
         n_docs, n_terms = tf.shape
 
+        # Длина документа = сумма всех вхождений термов в строке.
         doc_len = np.asarray(tf.sum(axis=1)).ravel()
         avgdl = doc_len.mean()
 
-        # document frequency per term = number of docs with a nonzero entry
+        # Документная частота термина (df) = число документов, где он
+        # встретился хотя бы раз = число ненулевых значений в столбце.
+        # tf.tocsc().indptr даёт границы столбцов в CSC-представлении,
+        # разница соседних границ -- это как раз количество ненулевых
+        # элементов в каждом столбце.
         df = np.diff(tf.tocsc().indptr)
         idf = np.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
         self.idf_ = idf.astype(np.float32)
 
-        # length-normalization factor per document, broadcast to every
-        # nonzero of that row via CSR row pointers
+        # Множитель нормировки по длине документа (часть знаменателя
+        # BM25): длинные документы дают меньший вес каждому отдельному
+        # вхождению термина. Считаем его один раз на документ, а затем
+        # "размножаем" на каждый ненулевой элемент этой строки через
+        # CSR-указатели строк (indptr) -- это позволяет обойтись без
+        # Python-цикла по документам.
         len_norm = (1.0 - self.b + self.b * doc_len / avgdl).astype(np.float32)
         row_of_nnz = np.repeat(np.arange(n_docs), np.diff(tf.indptr))
 
+        # Собственно формула BM25 для каждого ненулевого элемента (d, t):
         f = tf.data
         denom = f + self.k1 * len_norm[row_of_nnz]
         tf_weight = f * (self.k1 + 1.0) / denom
         bm25_data = tf_weight * self.idf_[tf.indices]
 
+        # Собираем итоговую разреженную матрицу BM25-весов с той же
+        # структурой ненулевых позиций (indices/indptr), что и у tf --
+        # меняются только сами значения.
         self.bm25_matrix = sparse.csr_matrix(
             (bm25_data, tf.indices, tf.indptr), shape=tf.shape
         )
         return self
 
     def transform_query(self, query_texts):
-        """Raw term-count vectors for queries, in the corpus vocabulary."""
+        """Перевести тексты запросов в векторы "сырых" частот термина в
+        словаре корпуса объявлений (тем же CountVectorizer, что и для
+        документов -- .transform(), а не .fit_transform(), чтобы словарь
+        не менялся и оставался согласован со стороной объявлений)."""
         return self.vectorizer.transform(query_texts).tocsr()
 
     def score(self, query_texts):
-        """Return sparse (n_queries, n_docs) BM25 score matrix.
+        """Вернуть разреженную матрицу BM25-скоров (n_queries x n_docs).
 
-        Only safe to call for a small number of queries / a pruned
-        vocabulary -- see `score_chunked` for the memory-safe version used
-        on the real (~190k-item) corpus."""
+        Скор запроса к документу в BM25 -- это сумма по общим термам
+        IDF(term) * BM25_вес_термина_в_документе, что ровно равно
+        скалярному произведению вектора "сырых" частот запроса на
+        BM25-взвешенную матрицу документов (self.bm25_matrix), потому
+        что IDF уже "зашит" в bm25_matrix при fit().
+
+        Безопасно вызывать только для небольшого числа запросов (или
+        сильно урезанного словаря) -- для реального корпуса (~190 тыс.
+        объявлений) используйте `score_chunked`, версию с ограниченным
+        потреблением памяти."""
         q = self.transform_query(query_texts)
         return q @ self.bm25_matrix.T
 
     def score_chunked(self, query_texts, chunk_size: int = 200):
-        """Score queries against the corpus in chunks, yielding one CSR
-        block at a time instead of materializing the full (n_queries x
-        n_docs) product at once.
+        """Считать скор запросов к корпусу порциями (чанками), отдавая
+        по одному CSR-блоку за раз вместо того, чтобы держать в памяти
+        сразу всё произведение (n_queries x n_docs).
 
-        Even after max_df pruning, a handful of moderately common terms
-        shared between a chunk of queries and the ~190k-item corpus can
-        still produce a fairly dense intermediate matrix. Chunking bounds
-        peak memory to O(chunk_size * n_docs) instead of
-        O(n_queries * n_docs), which is what let this run comfortably
-        without exhausting RAM (we saw >10GB RSS before adding this).
-        """
+        Даже после отсечки max_df несколько умеренно частых терминов,
+        общих для целого чанка запросов и корпуса из ~190 тыс.
+        объявлений, всё ещё могут дать довольно плотную промежуточную
+        матрицу. Разбиение на чанки ограничивает пиковую память
+        величиной O(chunk_size * n_docs) вместо O(n_queries * n_docs) --
+        именно это позволило прогонять расчёт без падения по нехватке
+        памяти (до этого исправления наблюдали >10 ГБ RSS)."""
         q_all = self.transform_query(query_texts)
         n = q_all.shape[0]
         for start in range(0, n, chunk_size):
@@ -103,9 +148,15 @@ class BM25Index:
 
 
 def top_k_per_row(score_matrix: sparse.csr_matrix, k: int):
-    """For a sparse (n_rows, n_cols) score matrix, return, for every row,
-    the column indices of its k highest values (descending), without ever
-    densifying the whole matrix."""
+    """Для разреженной матрицы скоров (n_rows x n_cols) вернуть для
+    каждой строки индексы столбцов её k наибольших значений (по убыванию),
+    ни разу не превращая всю матрицу в плотную (dense).
+
+    Вспомогательная утилита общего назначения; в основном пайплайне
+    (см. src/ranking.py) топ-k считается внутри boosted_top_k, потому что
+    там до отбора топ-k ещё нужно применить исторические priors -- эта
+    функция оставлена как самостоятельный, более простой строительный
+    блок и используется в юнит-проверках / экспериментах."""
     score_matrix = score_matrix.tocsr()
     n_rows = score_matrix.shape[0]
     results = []
@@ -114,6 +165,10 @@ def top_k_per_row(score_matrix: sparse.csr_matrix, k: int):
         cols = score_matrix.indices[start:end]
         vals = score_matrix.data[start:end]
         if len(vals) > k:
+            # argpartition быстрее полной сортировки: он гарантирует
+            # только то, что k наибольших элементов окажутся в конце
+            # массива (в произвольном порядке между собой), чего
+            # достаточно, чтобы отсечь "хвост".
             part = np.argpartition(vals, -k)[-k:]
             cols, vals = cols[part], vals[part]
         order = np.argsort(-vals)

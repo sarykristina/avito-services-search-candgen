@@ -1,39 +1,55 @@
 """
-Turns raw BM25 scores into the final top-K candidate list per query, by
-layering two extra signals learned from historical (query -> chosen item)
-pairs in train.parquet:
+Превращает "сырые" BM25-скоры в финальный список топ-K кандидатов на
+запрос, накладывая два дополнительных сигнала, выученных по историческим
+парам (запрос -> выбранное объявление) из train.parquet:
 
-1. Microcategory prior: if the (normalized) query text was seen before,
-   look at which item_microcat_id(s) users ended up choosing for it, and
-   give a multiplicative boost to same-microcategory candidates. This is
-   a soft boost (never a hard filter), so it cannot hurt recall when the
-   category prior is wrong or the query text is unseen -- it can only
-   re-rank within the BM25 shortlist and, when combined with (2), pull in
-   items that pure text overlap ranked outside the top 50.
+1. Prior по микрокатегории: если такой (нормализованный) текст запроса
+   уже встречался раньше, смотрим, в каких item_microcat_id пользователи
+   в итоге выбирали объявления по нему, и даём мультипликативный буст
+   объявлениям той же микрокатегории. Это МЯГКИЙ буст (никогда не жёсткий
+   фильтр), поэтому в теории он не должен вредить recall, даже если
+   категорийный prior ошибается или текст запроса вообще не встречался
+   раньше -- он может только переупорядочить уже отобранный BM25-список.
+   НА ПРАКТИКЕ этот буст стабильно ухудшал офлайн-recall и в финальном
+   решении отключён (alpha_microcat=0.0) -- см. пункт 3 в разделе
+   "Найденные ошибки" README.md. Код и логика буста оставлены в
+   реализации намеренно: во-первых, чтобы отрицательный результат был
+   воспроизводим и виден в scripts/run_validation.py, а не потерялся;
+   во-вторых, чтобы им было легко воспользоваться в будущем, если
+   появится более точный источник категорийного prior'а.
 
-2. Historical exact-item memorization: if the same query text previously
-   led to a specific item_id that still exists in the current corpus,
-   that item is forced into the candidate list (huge additive bonus, or
-   appended if the BM25 pass didn't retrieve it at all). This directly
-   captures "this exact query has a known good answer in the corpus"
-   without ever touching benchmark labels -- the prior comes only from
-   train.parquet's OTHER (fit-side) rows.
+2. Историческая "меморизация" точного объявления: если этот же самый
+   текст запроса раньше уже приводил к конкретному item_id, который
+   всё ещё существует в текущем корпусе, это объявление принудительно
+   попадает в список кандидатов (либо получает огромный аддитивный
+   бонус, если BM25 и так его нашёл, либо добавляется "с нуля", если
+   BM25-проход вообще не выдал по нему ненулевой скор). Это напрямую
+   использует сигнал "у этого конкретного запроса уже есть известный
+   хороший ответ" -- легитимное использование предоставленного лога
+   запросов (train.parquet), а не утечка разметки бенчмарка: разметки
+   бенчмарка просто не существует, prior строится один раз по
+   train.parquet и затем применяется как есть к корпусу
+   benchmark_items.parquet.
 
-   IMPORTANT: this is only safe for query texts that map to a SMALL,
-   concentrated set of historical items. A generic one-word query like
-   "маникюр" has >5000 distinct historically-chosen items in train.parquet
-   (one per provider per city) -- forcing all of them into the top 50
-   would drown out the location/text-specific BM25 signal entirely and
-   *reduce* recall (confirmed empirically: offline Recall@50 dropped from
-   0.182 to 0.151 before this cap was added). We only apply the
-   memorization boost when a query's historical item set has at most
-   `memo_max_distinct` distinct items (80% of train query texts have <=3,
-   so this still covers the large majority of "specific" queries where
-   memorization is trustworthy), and additionally cap how many items we
-   inject per query at `memo_top_n`.
+   ВАЖНО: этот прием безопасен ТОЛЬКО для текстов запроса, которые
+   ведут к небольшому, сконцентрированному множеству исторических
+   объявлений. Общий однословный запрос вроде "маникюр" имеет в
+   train.parquet больше 5000 различных исторических item_id (по одному
+   на каждого исполнителя в каждом городе) -- если форсировать в
+   кандидаты их все, это полностью заглушит специфичный для
+   локации/текста сигнал BM25 и УМЕНЬШИТ recall (подтверждено
+   эмпирически: офлайн Recall@50 упал с 0.182 до 0.151 до того, как
+   было добавлено ограничение ниже). Поэтому мы применяем
+   меморизационный буст только когда историческое множество объявлений
+   для текста запроса не больше `memo_max_distinct` элементов (у 81%
+   текстов запросов в train.parquet оно <=3, то есть подавляющее
+   большинство "специфичных" запросов, для которых меморизации можно
+   доверять, всё ещё покрыто), и дополнительно ограничиваем сверху
+   число добавляемых объявлений на запрос параметром `memo_top_n`.
 
-Both boosts sit on top of the BM25 shortlist; pure text relevance is
-always the fallback for queries with no (trustworthy) historical match.
+Оба буста накладываются НА УЖЕ ОТОБРАННЫЙ BM25-список кандидатов;
+для запросов без (надёжного) исторического совпадения единственным
+источником ранжирования всегда остаётся чистая текстовая релевантность.
 """
 
 import numpy as np
@@ -41,21 +57,29 @@ import pandas as pd
 
 
 def build_memo_prior(qtext_series, item_id_series, max_distinct=5, top_n=3):
-    """Build the query-text -> historical-item memorization prior used by
-    `boosted_top_k`, from (qtext_series, item_id_series) rows of a
-    query-log dataframe (e.g. train.parquet).
+    """Построить prior "текст запроса -> исторические объявления",
+    который использует `boosted_top_k`, по строкам (qtext_series,
+    item_id_series) из лога запросов (например, train.parquet).
 
-    Only keeps query texts whose historical item set has at most
-    `max_distinct` distinct items (see module docstring for why this
-    matters), and within those, only the `top_n` most frequently chosen
-    items. Returns a pd.Series: qtext -> list[item_id].
+    Оставляет только те тексты запроса, у которых множество исторических
+    объявлений не больше `max_distinct` элементов (см. пояснение в
+    докстринге модуля выше, почему это критически важно для recall), и
+    среди них берёт только `top_n` самых часто выбираемых объявлений.
+
+    Возвращает pd.Series: нормализованный текст запроса -> list[item_id].
     """
     grouped = item_id_series.groupby(qtext_series)
     result = {}
     for qtext, items in grouped:
+        # value_counts() сортирует по убыванию частоты -- это даёт нам
+        # "самые частые сначала" бесплатно, без отдельной сортировки.
         counts = items.value_counts()
         if len(counts) <= max_distinct:
             result[qtext] = counts.index[:top_n].tolist()
+        # если у текста запроса больше max_distinct различных
+        # исторических объявлений (общий запрос вроде "массаж") -- мы
+        # НЕ добавляем его в prior вообще: доверять такому "разбросу"
+        # исторических ответов небезопасно (см. докстринг выше).
     return pd.Series(result, dtype=object)
 
 
@@ -72,14 +96,24 @@ def rank_all(
     memo_bonus=1e6,
     chunk_size=200,
 ):
-    """Convenience wrapper: scores `query_texts` against `bm25_index` in
-    memory-safe chunks (see BM25Index.score_chunked) and applies
-    `boosted_top_k` to each chunk, returning the concatenated per-query
-    ranked item_id lists in original order."""
+    """Удобная обёртка: считает скор `query_texts` относительно
+    `bm25_index` порциями, безопасными по памяти (см.
+    BM25Index.score_chunked), и применяет `boosted_top_k` к каждой
+    порции, возвращая объединённые ранжированные списки item_id по
+    каждому запросу в исходном порядке.
+
+    Разбиение на чанки здесь -- чисто техническая мера (см. bm25.py):
+    сама логика бустинга применяется к каждому чанку независимо и не
+    меняется от того, что запросы обрабатываются порциями, а не все
+    сразу."""
     results = []
     for start in range(0, len(query_texts), chunk_size):
         chunk_texts = query_texts[start:start + chunk_size]
         chunk_qtext = qtext_norm_list[start:start + chunk_size]
+        # score_chunked -- генератор; т.к. мы сами уже нарезали чанк
+        # нужного размера, chunk_size=len(chunk_texts) гарантирует, что
+        # он отдаст этот чанк целиком за один next() без дополнительного
+        # внутреннего разбиения.
         scores_chunk = next(bm25_index.score_chunked(chunk_texts, chunk_size=len(chunk_texts)))
         results.extend(boosted_top_k(
             chunk_qtext, scores_chunk, item_ids_sorted, item_microcat,
@@ -101,23 +135,37 @@ def boosted_top_k(
     memo_bonus=1e6,
 ):
     """
-    qtext_norm_list      -- list[str], normalized query text per query row
-    bm25_scores_csr       -- scipy CSR (n_queries, n_items) BM25 scores
-    item_ids_sorted       -- np.array of item_id, SORTED ascending, aligned
-                             with bm25_scores_csr columns
-    item_microcat         -- np.array, item_microcat_id aligned with item_ids_sorted
-    qtext_to_items        -- pd.Series: normalized query text -> set(item_id)
-    qtext_to_microcat     -- pd.Series: normalized query text -> {microcat_id: prob}
+    Параметры:
+      qtext_norm_list    -- list[str], нормализованный текст запроса для
+                             каждой строки (см. normalize_query_text)
+      bm25_scores_csr    -- разреженная CSR-матрица (n_queries x n_items)
+                             BM25-скоров
+      item_ids_sorted    -- np.array с item_id, ОТСОРТИРОВАННЫЙ по
+                             возрастанию, согласованный по индексам со
+                             столбцами bm25_scores_csr (нужен для
+                             np.searchsorted при добавлении
+                             меморизационных объявлений)
+      item_microcat      -- np.array с item_microcat_id, согласованный по
+                             индексам с item_ids_sorted
+      qtext_to_items     -- pd.Series: текст запроса -> список item_id
+                             (результат build_memo_prior)
+      qtext_to_microcat  -- pd.Series: текст запроса -> {microcat_id: доля}
     """
     results = []
     n = bm25_scores_csr.shape[0]
     for i in range(n):
+        # Достаём ненулевые BM25-скоры этого запроса напрямую из
+        # CSR-структуры (indptr/indices/data), без обращения к
+        # плотному представлению строки.
         start, end = bm25_scores_csr.indptr[i], bm25_scores_csr.indptr[i + 1]
         cols = bm25_scores_csr.indices[start:end].copy()
         vals = bm25_scores_csr.data[start:end].astype(np.float64).copy()
 
         qtext = qtext_norm_list[i]
 
+        # --- Буст по микрокатегории (в финальном решении отключён,
+        # alpha_microcat=0.0, но логика оставлена для воспроизводимости
+        # эксперимента и на будущее -- см. докстринг модуля) ---
         microcat_prior = (
             qtext_to_microcat.get(qtext) if qtext in qtext_to_microcat.index else None
         )
@@ -127,24 +175,48 @@ def boosted_top_k(
             for mc, p in microcat_prior.items():
                 boost_mask = cand_microcats == mc
                 if boost_mask.any():
+                    # Буст пропорционален p (доля исторических выборов
+                    # в эту микрокатегорию для данного текста запроса) и
+                    # масштабирован относительно максимального BM25-скора
+                    # ЭТОГО запроса -- иначе фиксированная константа была
+                    # бы либо ничтожной, либо доминирующей в зависимости
+                    # от абсолютной величины BM25-скоров конкретного
+                    # запроса (она сильно варьируется от запроса к
+                    # запросу из-за разной редкости слов).
                     vals[boost_mask] += alpha_microcat * p * max_v
 
+        # --- Меморизация точного исторического объявления ---
         memo_items = qtext_to_items.get(qtext) if qtext in qtext_to_items.index else None
         if memo_items:
             col_pos = {c: j for j, c in enumerate(cols)}
             extra_cols, extra_vals = [], []
             for it in memo_items:
+                # item_ids_sorted отсортирован -> бинарный поиск вместо
+                # линейного сканирования всего корпуса на каждый запрос.
                 pos = np.searchsorted(item_ids_sorted, it)
                 if pos < len(item_ids_sorted) and item_ids_sorted[pos] == it:
                     if pos in col_pos:
+                        # BM25 и так нашёл это объявление (есть общие
+                        # слова с запросом) -- просто добавляем сверху
+                        # огромный бонус, чтобы гарантированно попасть
+                        # в топ-k.
                         vals[col_pos[pos]] += memo_bonus
                     else:
+                        # BM25 вообще не дал по нему ненулевой скор
+                        # (текст запроса и текст объявления не пересекаются
+                        # лексически) -- добавляем "с нуля" отдельной
+                        # записью.
                         extra_cols.append(pos)
                         extra_vals.append(memo_bonus)
+                # если item_id из истории отсутствует в текущем корпусе
+                # (в реальности -- в benchmark_items.parquet), просто
+                # пропускаем: подсунуть несуществующий item_id в ответ
+                # нельзя по условию задания.
             if extra_cols:
                 cols = np.concatenate([cols, np.array(extra_cols)])
                 vals = np.concatenate([vals, np.array(extra_vals)])
 
+        # --- Финальный отбор топ-k по итоговому (BM25 + бусты) скору ---
         if len(vals) > k:
             part = np.argpartition(vals, -k)[-k:]
             cols, vals = cols[part], vals[part]
