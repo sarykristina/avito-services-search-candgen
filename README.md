@@ -1,5 +1,7 @@
 # Avito services search — candidate generation (Recall@50)
 
+> Русская версия: [README.ru.md](README.ru.md).
+
 Candidate-generation stage for the two-stage search cascade described in
 the task: given a short service-search query, return up to 50 `item_id`
 candidates from `benchmark_items.parquet` for the ranking stage to
